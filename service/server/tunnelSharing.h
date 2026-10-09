@@ -29,6 +29,8 @@ public:
         const auto dir = QCoreApplication::applicationDirPath();
         if (!QFileInfo::exists(dir + "/sharing/Share.ps1") || !QFileInfo::exists(dir + "/sharing/tapbridge.exe"))
             return fail("Sharing components are missing. Install the complete Share package.");
+        m_ssid = ssid;
+        m_password = password;
         m_firewallReplyFile = qEnvironmentVariable("ProgramData") +
             "/AmneziaVPN Share/log/tap-firewall-" +
             QUuid::createUuid().toString(QUuid::WithoutBraces) + ".reply";
@@ -59,7 +61,28 @@ public:
         return fail("Tunnel Sharing is available on Windows only.");
 #endif
     }
+    void suspendForXrayRestart() {
+        if (m_process.state() == QProcess::NotRunning) return;
+        m_restartAfterXray = true;
+        m_resumeEndpoint = {};
+        trace("XRay restart requested; preserving Tunnel Sharing settings.");
+        stopWorker();
+    }
+    void resumeAfterXrayStart(const QJsonObject &endpoint) {
+        if (!m_restartAfterXray || endpoint.isEmpty()) return;
+        m_resumeEndpoint = endpoint;
+        trace("XRay started; scheduling Tunnel Sharing resume.");
+        QTimer::singleShot(1500, this, [this] { resumeIfReady(); });
+    }
     QJsonObject stop() {
+        m_restartAfterXray = false;
+        m_resumeEndpoint = {};
+        m_ssid.clear();
+        m_password.clear();
+        return stopWorker();
+    }
+private:
+    QJsonObject stopWorker() {
         if (m_process.state() != QProcess::NotRunning) {
             m_state = "stopping"; m_message = "Stopping hotspot and restoring sharing";
             if (!m_stopFile.isEmpty()) {
@@ -87,7 +110,20 @@ public:
         } else { m_state = "stopped"; m_message.clear(); }
         return status();
     }
-private:
+    void resumeIfReady() {
+        if (!m_restartAfterXray || m_resumeEndpoint.isEmpty()) return;
+        if (m_process.state() != QProcess::NotRunning) {
+            QTimer::singleShot(500, this, [this] { resumeIfReady(); });
+            return;
+        }
+        const auto endpoint = m_resumeEndpoint;
+        const auto ssid = m_ssid;
+        const auto password = m_password;
+        m_restartAfterXray = false;
+        m_resumeEndpoint = {};
+        trace("Restarting Tunnel Sharing after XRay recovered.");
+        start(endpoint, ssid, password);
+    }
     void trace(const QString &message) const {
         const auto path = qEnvironmentVariable("ProgramData") +
                           "/AmneziaVPN Share/log/tunnel-sharing-trace.log";
@@ -214,6 +250,8 @@ private:
                 m_state = code == 0 ? "stopped" : "error";
                 m_message = code == 0 ? QString() : "Sharing worker exited unexpectedly.";
             }
+            if (m_restartAfterXray && !m_resumeEndpoint.isEmpty())
+                QTimer::singleShot(500, this, [this] { resumeIfReady(); });
         });
     }
     ~TunnelSharing() { stop(); if (!m_process.waitForFinished(15000)) { m_process.kill(); m_process.waitForFinished(3000); } }
@@ -226,4 +264,7 @@ private:
     bool m_waitingForTapReply = false;
     bool m_waitingForHotspotReply = false;
     QString m_state = "stopped", m_message;
+    QString m_ssid, m_password;
+    QJsonObject m_resumeEndpoint;
+    bool m_restartAfterXray = false;
 };

@@ -104,12 +104,14 @@ bool Xray::startXray(const QString &cfg)
         return false;
     }
 
+    TunnelSharing::instance().resumeAfterXrayStart(m_socksEndpoint);
+
     return true;
 }
 
 bool Xray::stopXray()
 {
-    TunnelSharing::instance().stop();
+    TunnelSharing::instance().suspendForXrayRestart();
     qDebug() << "Xray::stopXray()";
     bool success = true;
     m_socksEndpoint = {};
