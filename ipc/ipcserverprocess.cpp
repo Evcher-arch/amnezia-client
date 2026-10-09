@@ -35,9 +35,21 @@ void IpcServerProcess::start()
 
     Utils::killProcessByName(m_process->program());
     m_process->start();
-    qDebug() << "IpcServerProcess started, " << m_process->program() << m_process->arguments();
+    qDebug() << "IpcServerProcess started, " << m_process->program();
 
     m_process->waitForStarted();
+}
+
+void IpcServerProcess::clientDisconnected()
+{
+    // The TUN belongs to this client's process replica, not to the lifetime
+    // of the service. An abruptly closed UI must not leave it behind.
+    if (m_program == amnezia::PermittedProcess::Tun2Socks &&
+        m_process->state() != QProcess::NotRunning) {
+        qDebug() << "Stopping tun2socks after its control connection closed";
+        m_process->kill();
+        m_process->waitForFinished(3000);
+    }
 }
 
 void IpcServerProcess::terminate() {

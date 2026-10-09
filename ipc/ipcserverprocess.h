@@ -18,6 +18,7 @@ public:
     void terminate() override;
     void kill() override;
     void close() override;
+    void clientDisconnected();
 
     void setArguments(const QStringList &arguments) override;
     void setInputChannelMode(QProcess::InputChannelMode mode) override;

@@ -1,6 +1,7 @@
 #include <QCoreApplication>
 #include <QDebug>
 #include <QDir>
+#include <QFileInfo>
 #include <QProcess>
 #include <QRandomGenerator>
 #include <QRegularExpression>
@@ -217,6 +218,10 @@ bool Utils::killProcessByName(const QString &name)
 {
     qDebug().noquote() << "Kill process" << name;
 #ifdef Q_OS_WIN
+    const QFileInfo requestedProcess(name);
+    const QString executableName = requestedProcess.fileName();
+    const bool matchFullPath = requestedProcess.isAbsolute();
+    const QString expectedPath = QDir::cleanPath(QDir::fromNativeSeparators(name));
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot == INVALID_HANDLE_VALUE)
         return false;
@@ -230,11 +235,27 @@ bool Utils::killProcessByName(const QString &name)
         do {
             QString exeFile = QString::fromWCharArray(pe32.szExeFile);
 
-            if (exeFile.compare(name, Qt::CaseInsensitive) == 0) {
-                HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+            if (exeFile.compare(executableName, Qt::CaseInsensitive) == 0) {
+                HANDLE hProcess = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE |
+                                               PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe32.th32ProcessID);
                 if (hProcess != NULL) {
+                    // A full path must not terminate another VPN installation's
+                    // executable merely because it has the same basename.
+                    if (matchFullPath) {
+                        wchar_t imagePath[32768];
+                        DWORD length = DWORD(std::size(imagePath));
+                        const bool matches = QueryFullProcessImageNameW(hProcess, 0, imagePath, &length) &&
+                            QDir::cleanPath(QDir::fromNativeSeparators(QString::fromWCharArray(imagePath, length)))
+                                .compare(expectedPath, Qt::CaseInsensitive) == 0;
+                        if (!matches) {
+                            CloseHandle(hProcess);
+                            continue;
+                        }
+                    }
                     if (TerminateProcess(hProcess, 0)) {
-                        success = true;
+                        // Wait for its TUN handle to close before a replacement
+                        // tun2socks can create another adapter with the same name.
+                        success = WaitForSingleObject(hProcess, 3000) == WAIT_OBJECT_0;
                     } else {
                         DWORD error = GetLastError();
                         qCritical() << "Can't terminate process" << exeFile << "(PID:" << pe32.th32ProcessID << "). Error:" << printErrorMessage(error);

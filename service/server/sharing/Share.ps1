@@ -1,4 +1,4 @@
-# Runs as a child of the Amnezia service. No credentials on disk or argv.
+﻿# Runs as a child of the Amnezia service. No credentials on disk or argv.
 $ErrorActionPreference = 'Stop'
 [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
@@ -50,6 +50,22 @@ function Set-ShareIPv4Forwarding([int]$InterfaceIndex, [string]$State, [string]$
         throw "IPv4 forwarding did not become $State on interface $InterfaceIndex in $Store store."
     }
 }
+function Sync-ShareVpnRoutes([int]$VpnInterfaceIndex, [int]$TapInterfaceIndex) {
+    $routes = @(Get-NetRoute -InterfaceIndex $VpnInterfaceIndex -AddressFamily IPv4 -ErrorAction Stop |
+        Where-Object { $_.Protocol.ToString() -ne 'Local' -and $_.DestinationPrefix -ne '0.0.0.0/0' })
+    foreach ($route in $routes) {
+        $prefix = [string]$route.DestinationPrefix
+        $existing = @(Get-NetRoute -InterfaceIndex $TapInterfaceIndex -DestinationPrefix $prefix -ErrorAction SilentlyContinue)
+        if (@($existing | Where-Object NextHop -ne '10.254.254.2').Count) {
+            throw "The TAP adapter already has a conflicting route for $prefix."
+        }
+        if (!$existing.Count) {
+            New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $TapInterfaceIndex -NextHop '10.254.254.2' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+        }
+        # Include recovered routes so the owner removes them during shutdown.
+        $prefix
+    }
+}
 Report 'starting' 'Загружаю модуль сетевой службы…'
 Import-Module (Join-Path $PSScriptRoot 'Hotspot.psm1') -Force
 Report 'starting' 'Модуль загружен; принимаю параметры запуска…'
@@ -64,6 +80,7 @@ $tapOverrideRoutesAdded = @()
 $tapMirroredRoutesAdded = @()
 $snapshot = @()
 $failed = $false
+$failureMessage = ''
 $configChanged = $false
 $icsConfigured = $false
 $natName = 'AmneziaVPNShare'
@@ -249,6 +266,23 @@ try {
     Report 'starting' 'Настраиваю IPv4 TAP-адаптера…'
     $existing = @(Get-NetIPAddress -InterfaceIndex $tap.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object IPAddress -eq '10.254.254.1')
     if (!$existing.Count) { New-NetIPAddress -InterfaceIndex $tap.ifIndex -IPAddress '10.254.254.1' -PrefixLength 24 | Out-Null }
+    # The bridge's ready marker only means its packet loop has started.
+    # Windows may still be checking the TAP address (DAD). Route selection
+    # fails with ERROR_NETWORK_UNREACHABLE until it has a usable source IP.
+    Report 'starting' 'Ожидаю готовности IPv4 TAP-адаптера…'
+    $tapAddressDeadline = (Get-Date).AddSeconds(15)
+    do {
+        Assert-ShareNotStopping
+        if ($bridge.HasExited) { throw 'Packet bridge stopped while waiting for the TAP address.' }
+        $tapAddress = Get-NetIPAddress -InterfaceIndex $tap.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object IPAddress -eq '10.254.254.1' | Select-Object -First 1
+        if ($tapAddress -and $tapAddress.AddressState.ToString() -eq 'Preferred') { break }
+        if ($tapAddress -and $tapAddress.AddressState.ToString() -eq 'Duplicate') {
+            throw 'The dedicated TAP address 10.254.254.1 conflicts with another device.'
+        }
+        if ((Get-Date) -ge $tapAddressDeadline) { throw 'Windows did not make the TAP IPv4 address ready within 15 seconds.' }
+        Start-Sleep -Milliseconds 250
+    } while ($true)
     Report 'starting' 'Настраиваю DNS TAP-адаптера…'
     $dns = Get-DnsClientServerAddress -InterfaceIndex $tap.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
     $desiredDns = @('1.1.1.1','9.9.9.9')
@@ -315,19 +349,7 @@ try {
     # non-local IPv4 route from that TUN onto TAP with a lower effective metric.
     $vpnForwardingRoutes = @(Get-NetRoute -InterfaceIndex $vpnAdapter.ifIndex -AddressFamily IPv4 -ErrorAction Stop |
         Where-Object { $_.Protocol.ToString() -ne 'Local' -and $_.DestinationPrefix -ne '0.0.0.0/0' })
-    foreach ($vpnRoute in $vpnForwardingRoutes) {
-        $prefix = [string]$vpnRoute.DestinationPrefix
-        $tapRoute = @(Get-NetRoute -InterfaceIndex $tap.ifIndex -DestinationPrefix $prefix -ErrorAction SilentlyContinue)
-        if ($tapRoute.Count -gt 0) {
-            if (@($tapRoute | Where-Object NextHop -ne '10.254.254.2').Count -gt 0) {
-                throw "The TAP adapter already has a conflicting route for $prefix."
-            }
-            $tapMirroredRoutesAdded += $prefix
-            continue
-        }
-        New-NetRoute -DestinationPrefix $prefix -InterfaceIndex $tap.ifIndex -NextHop '10.254.254.2' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
-        $tapMirroredRoutesAdded += $prefix
-    }
+    $tapMirroredRoutesAdded = @(Sync-ShareVpnRoutes $vpnAdapter.ifIndex $tap.ifIndex)
     foreach ($vpnRoute in $vpnForwardingRoutes) {
         $selected = Find-NetRoute -RemoteIPAddress ([string]$vpnRoute.DestinationPrefix.Split('/')[0]) -ErrorAction Stop |
             Where-Object { $_.CimClass.CimClassName -eq 'MSFT_NetRoute' } | Select-Object -First 1
@@ -418,14 +440,19 @@ try {
                     Write-ShareDiagnostic ('Restored IPv4 forwarding on ' + $interface.InterfaceAlias)
                 }
             }
+
             $lastForwardingRefresh = Get-Date
         }
+        # DNS host routes can appear after startup. Refresh each control tick.
+        $tapMirroredRoutesAdded = @($tapMirroredRoutesAdded +
+            @(Sync-ShareVpnRoutes $vpnAdapter.ifIndex $tap.ifIndex) | Select-Object -Unique)
         if ($bridge.HasExited) { throw 'Packet bridge stopped; shutting down sharing.' }
         if ((Get-HotspotState) -ne 'On') { throw 'Windows stopped the hotspot.' }
     }
 } catch {
     $failed = $true
-    Write-ShareDiagnostic ('ERROR ' + $_.Exception.ToString())
+    $failureMessage = $_.Exception.Message
+    Write-ShareDiagnostic ('ERROR ' + $_.Exception.ToString() + [Environment]::NewLine + $_.ScriptStackTrace)
     Report 'error' $_.Exception.Message
 } finally {
     if ($readyFile -and (Test-Path -LiteralPath $readyFile)) { Remove-Item -LiteralPath $readyFile -Force -ErrorAction SilentlyContinue }
@@ -495,5 +522,9 @@ try {
         } catch { }
     }
 }
-if ($failed) { exit 1 }
+if ($failed) {
+    if (!$failureMessage) { $failureMessage = 'Tunnel Sharing cleanup failed. See share-worker.log.' }
+    Report 'error' $failureMessage
+    exit 1
+}
 Report 'stopped' ''

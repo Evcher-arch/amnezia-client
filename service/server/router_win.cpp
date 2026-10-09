@@ -371,6 +371,19 @@ bool RouterWin::createTun(const QString &dev, const QString &subnet)
         return false;
     }
 
+    // Reusing a TUN can leave its address assigned. Windows does not emit a
+    // new notification for ERROR_OBJECT_ALREADY_EXISTS; also, assignment can
+    // finish before we start waiting. Check the actual address in both cases.
+    MIB_UNICASTIPADDRESS_ROW assigned = row;
+    if (GetUnicastIpAddressEntry(&assigned) == NO_ERROR) {
+        if (assigned.DadState == IpDadStatePreferred)
+            return true;
+        if (assigned.DadState == IpDadStateDuplicate) {
+            qCritical() << "Duplicate IP address on TUN" << dev;
+            return false;
+        }
+    }
+
     res = WaitForSingleObject(hEvent, 10000);
     if (res == WAIT_TIMEOUT) {
         qCritical() << "Timeout of waiting for IP assignment for " << dev << " device";

@@ -1,5 +1,9 @@
 # AmneziaVPN Share (Windows)
 
+**100% рабочая версия — подтверждено пользователем 09.10.2026.**
+Tagged checkpoint: `amnezia-share-working-2026-10-09`.
+See [WORKING_VERSION.md](WORKING_VERSION.md) for the verified fixes and installed file checksums.
+
 Adds Settings > Tunnel Sharing to AmneziaVPN. Connect XRay, enter a Wi-Fi name
 and an 8–63 character password, then enable sharing. Closing the dialog keeps
 sharing active. Stop sharing before disconnecting; disconnect also stops it.
