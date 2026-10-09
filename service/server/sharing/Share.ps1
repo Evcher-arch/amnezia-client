@@ -35,17 +35,19 @@ function Invoke-ShareCommand($fileName, $arguments, $timeoutMs = 5000) {
     $process.Dispose()
     return $result
 }
-function Set-ShareIPv4Forwarding([int]$InterfaceIndex, [string]$State) {
+function Set-ShareIPv4Forwarding([int]$InterfaceIndex, [string]$State, [string]$Store = 'active') {
     if ($State -notin @('Enabled','Disabled')) { throw "Invalid IPv4 forwarding state: $State" }
+    if ($Store -notin @('active','persistent')) { throw "Invalid IPv4 forwarding store: $Store" }
     $value = $State.ToLowerInvariant()
     $netsh = Join-Path $env:SystemRoot 'System32\netsh.exe'
-    $result = Invoke-ShareCommand $netsh "interface ipv4 set interface $InterfaceIndex forwarding=$value store=active" 5000
+    $result = Invoke-ShareCommand $netsh "interface ipv4 set interface $InterfaceIndex forwarding=$value store=$Store" 5000
     if ($result.ExitCode -ne 0) {
-        throw "netsh could not set IPv4 forwarding on interface $InterfaceIndex`: $($result.Error) $($result.Output)"
+        throw "netsh could not set IPv4 forwarding on interface $InterfaceIndex in $Store store`: $($result.Error) $($result.Output)"
     }
-    $verified = Get-NetIPInterface -InterfaceIndex $InterfaceIndex -AddressFamily IPv4 -ErrorAction Stop
+    $policyStore = if ($Store -eq 'persistent') { 'PersistentStore' } else { 'ActiveStore' }
+    $verified = Get-NetIPInterface -InterfaceIndex $InterfaceIndex -AddressFamily IPv4 -PolicyStore $policyStore -ErrorAction Stop
     if ($verified.Forwarding.ToString() -ne $State) {
-        throw "IPv4 forwarding did not become $State on interface $InterfaceIndex."
+        throw "IPv4 forwarding did not become $State on interface $InterfaceIndex in $Store store."
     }
 }
 Report 'starting' 'Загружаю модуль сетевой службы…'
@@ -68,7 +70,9 @@ $natName = 'AmneziaVPNShare'
 $hotspotForwardingOriginal = $null
 $hotspotClampMssOriginal = $null
 $vpnForwardingOriginal = $null
+$vpnForwardingPersistentOriginal = $null
 $tapForwardingOriginal = $null
+$tapForwardingPersistentOriginal = $null
 $tapMtuOriginal = $null
 $tapClampMssOriginal = $null
 $tapAutomaticMetricOriginal = $null
@@ -374,9 +378,14 @@ try {
     $hotspotForwardingOriginal = $hotspotIpInterface.Forwarding.ToString()
     $hotspotClampMssOriginal = $hotspotIpInterface.ClampMss.ToString()
     $tapForwardingOriginal = $tapIpInterface.Forwarding.ToString()
-    if ($vpnForwardingOriginal -ne 'Enabled') {
-        Set-ShareIPv4Forwarding ([int]$vpnAdapter.ifIndex) 'Enabled'
-    }
+    $vpnPersistentInterface = Get-NetIPInterface -InterfaceIndex $vpnAdapter.ifIndex -AddressFamily IPv4 -PolicyStore PersistentStore -ErrorAction Stop
+    $tapPersistentInterface = Get-NetIPInterface -InterfaceIndex $tap.ifIndex -AddressFamily IPv4 -PolicyStore PersistentStore -ErrorAction Stop
+    # Empty persistent values mean Windows' default (forwarding disabled).
+    $vpnForwardingPersistentOriginal = if ($vpnPersistentInterface.Forwarding) { $vpnPersistentInterface.Forwarding.ToString() } else { 'Disabled' }
+    $tapForwardingPersistentOriginal = if ($tapPersistentInterface.Forwarding) { $tapPersistentInterface.Forwarding.ToString() } else { 'Disabled' }
+    Set-ShareIPv4Forwarding ([int]$vpnAdapter.ifIndex) 'Enabled'
+    Set-ShareIPv4Forwarding ([int]$vpnAdapter.ifIndex) 'Enabled' 'persistent'
+    Set-ShareIPv4Forwarding ([int]$vpnAdapter.ifIndex) 'Enabled'
     if ($hotspotForwardingOriginal -ne 'Enabled') {
         Set-ShareIPv4Forwarding ([int]$privateAdapter.ifIndex) 'Enabled'
     }
@@ -386,9 +395,9 @@ try {
         # MSS clamping still protects the smaller TAP/XRay path.
         Set-NetIPInterface -InterfaceIndex $privateAdapter.ifIndex -AddressFamily IPv4 -NlMtuBytes 1500 -ClampMss Enabled -PolicyStore ActiveStore -ErrorAction Stop
     }
-    if ($tapForwardingOriginal -ne 'Enabled') {
-        Set-ShareIPv4Forwarding ([int]$tap.ifIndex) 'Enabled'
-    }
+    Set-ShareIPv4Forwarding ([int]$tap.ifIndex) 'Enabled'
+    Set-ShareIPv4Forwarding ([int]$tap.ifIndex) 'Enabled' 'persistent'
+    Set-ShareIPv4Forwarding ([int]$tap.ifIndex) 'Enabled'
     $forwardingCheck = @(Get-NetIPInterface -InterfaceIndex @($vpnAdapter.ifIndex,$privateAdapter.ifIndex,$tap.ifIndex) -AddressFamily IPv4 -ErrorAction Stop)
     $forwardingFailures = @($forwardingCheck | Where-Object { $_.Forwarding.ToString() -ne 'Enabled' })
     if ($forwardingFailures.Count) {
@@ -422,19 +431,25 @@ try {
     if ($readyFile -and (Test-Path -LiteralPath $readyFile)) { Remove-Item -LiteralPath $readyFile -Force -ErrorAction SilentlyContinue }
     Report 'stopping' 'Останавливаю точку доступа…'
     Reset-ShareControlTask
-    if ($hotspotStarted) { try { Disable-Hotspot } catch { Report 'error' ('Hotspot cleanup: ' + $_.Exception.Message); $failed=$true } }
     if ($null -ne $hotspotForwardingOriginal -and $null -ne $privateAdapter) {
         try { Set-ShareIPv4Forwarding ([int]$privateAdapter.ifIndex) $hotspotForwardingOriginal } catch { }
     }
     if ($null -ne $hotspotClampMssOriginal -and $null -ne $privateAdapter) {
         try { Set-NetIPInterface -InterfaceIndex $privateAdapter.ifIndex -AddressFamily IPv4 -ClampMss $hotspotClampMssOriginal -PolicyStore ActiveStore -ErrorAction Stop } catch { }
     }
+    if ($null -ne $tapForwardingPersistentOriginal -and $null -ne $tap) {
+        try { Set-ShareIPv4Forwarding ([int]$tap.ifIndex) $tapForwardingPersistentOriginal 'persistent' } catch { }
+    }
     if ($null -ne $tapForwardingOriginal -and $null -ne $tap) {
         try { Set-ShareIPv4Forwarding ([int]$tap.ifIndex) $tapForwardingOriginal } catch { }
+    }
+    if ($null -ne $vpnForwardingPersistentOriginal -and $null -ne $vpnAdapter) {
+        try { Set-ShareIPv4Forwarding ([int]$vpnAdapter.ifIndex) $vpnForwardingPersistentOriginal 'persistent' } catch { }
     }
     if ($null -ne $vpnForwardingOriginal -and $null -ne $vpnAdapter) {
         try { Set-ShareIPv4Forwarding ([int]$vpnAdapter.ifIndex) $vpnForwardingOriginal } catch { }
     }
+    if ($hotspotStarted) { try { Disable-Hotspot } catch { Report 'error' ('Hotspot cleanup: ' + $_.Exception.Message); $failed=$true } }
     foreach ($prefix in $tapOverrideRoutesAdded) {
         $network = if ($prefix -eq '0.0.0.0/1') { '0.0.0.0' } else { '128.0.0.0' }
         try { Invoke-ShareCommand (Join-Path $env:SystemRoot 'System32\route.exe') "DELETE $network MASK 128.0.0.0 10.254.254.2 IF $($tap.ifIndex)" 5000 | Out-Null } catch { }
